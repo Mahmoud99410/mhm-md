@@ -1,0 +1,6 @@
+{
+  "appId": "com.mhm.md",
+  "appName": "MHM MD",
+  "webDir": "www",
+  "android": { "allowMixedContent": false }
+}

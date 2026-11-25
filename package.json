@@ -1,0 +1,37 @@
+{
+  "name": "mhm-md",
+  "version": "1.0.0",
+  "description": "MHM MD — convert PDF / Word / TXT into clean Markdown for Claude",
+  "main": "main.js",
+  "author": "Mahmoud",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "test": "node test/run.js",
+    "build:win": "electron-builder --win portable nsis --publish never",
+    "cap:sync": "cap sync android"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.2.0",
+    "@capacitor/core": "^6.2.0",
+    "@capacitor/filesystem": "^6.0.2",
+    "@capacitor/share": "^6.0.3"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.2.0",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "mammoth": "1.8.0",
+    "pdfjs-dist": "3.11.174",
+    "turndown": "7.2.0"
+  },
+  "build": {
+    "appId": "com.mhm.md",
+    "productName": "MHM MD",
+    "files": ["main.js", "www/**/*"],
+    "directories": { "output": "dist" },
+    "win": { "icon": "build/icon.png", "target": ["portable", "nsis"] },
+    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "artifactName": "MHM-MD-Setup-${version}.exe" },
+    "portable": { "artifactName": "MHM-MD-Portable-${version}.exe" }
+  }
+}

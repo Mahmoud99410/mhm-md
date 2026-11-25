@@ -1,0 +1,19 @@
+INSTRUCTIONS FOR THE AI
+
+
+Project: Shaheencar   
+
+Rules:
+- Always reply in Arabic.
+- Never delete user data.
+* Keep code   comments short.
+
+1) Build the API first
+2) Then the dashboard
+
+ملاحظات مهمة:
+• يجب أن يكون التصميم بسيطاً.
+• ممنوع استخدام الألوان الفاقعة.
+
+
+Thanks.......
