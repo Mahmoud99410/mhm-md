@@ -15,9 +15,15 @@ Turn **PDF, Word, PowerPoint, Excel, TXT, images and more** into clean, structur
   - `CLAUDE.md`: overview, detected tech stack, must / must-not rules, phases, key sections
   - `docs/` split by section, with `INDEX.md` (tokens + summary per file), so Claude Code reads only the parts it needs
 - **Merge files** into one MD; duplicated paragraphs across files are removed
+- **Optional 🌐 Arabic → English translation** with Claude, built for software specs:
+  - your own glossary plus terms extracted from the document, so one Arabic term always gets the same English term
+  - code, URLs and e-mails are protected; every rule keeps its original Arabic beside the English
+  - each part is checked automatically (numbers, headings, lists, tables, protected items, negations, untranslated text) and re-translated if something is off
+  - an optional second pass where Claude compares meaning against the original and fixes errors
+  - side-by-side compare view and one-click undo
 - **Optional ✨ improve with Claude API** (your key, stored on the device) restructures a document into a project spec
 - **Android:** appears in the *Share* / *Open with* menu. **Windows:** right-click a file or folder and choose *Convert to Markdown (MHM MD)* (installer version)
-- 100% local. Files never leave the device, except when you use the optional Claude API button.
+- 100% local. Files never leave the device, except when you choose translation or improvement. Then the text goes to Claude: through the API with your key in the apps, or through your Claude account in the web version.
 
 ## Download
 Latest builds are on the [**latest** release](../../releases/tag/latest):

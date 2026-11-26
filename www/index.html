@@ -62,13 +62,31 @@
   </details>
 
   <details class="opts" id="aiOpts">
-    <summary>✨ تحسين بواسطة Claude API (اختياري)</summary>
+    <summary>🤖 Claude: الترجمة والتحسين (اختياري)</summary>
     <div class="grid">
-      <p class="hint">يعيد Claude ترتيب المستند كمواصفات مشروع واضحة (متطلبات، معايير قبول، مراحل) دون حذف أي معلومة. يحتاج مفتاح API من console.anthropic.com ويُحفظ على جهازك فقط. يستهلك توكنز مرة واحدة.</p>
+      <p class="hint" id="aiBackendNote">في تطبيق الهاتف والكمبيوتر تحتاج مفتاح API من console.anthropic.com، ويُحفظ على جهازك فقط. في نسخة الويب يُستخدم حسابك في Claude مباشرة (يطلب موافقتك أول مرة) ولا تحتاج مفتاحاً.</p>
       <label class="row">مفتاح API:
         <input id="apiKey" type="password" autocomplete="off" placeholder="sk-ant-..." dir="ltr">
       </label>
-      <label class="row">النموذج:
+
+      <h3 class="sub">🌐 الترجمة من العربية إلى الإنجليزية</h3>
+      <label><input type="checkbox" data-opt="trAuto"> ترجمة الملفات العربية تلقائياً بعد التحويل</label>
+      <label class="row">جودة الترجمة:
+        <select data-opt="trQuality">
+          <option value="default">عالية — Claude Sonnet (مُوصى به)</option>
+          <option value="complex">قصوى — Claude Opus (أبطأ وأغلى)</option>
+        </select>
+      </label>
+      <label><input type="checkbox" data-opt="trReview"> مراجعة ثانية: Claude يقارن الترجمة بالأصل ويصحّح أخطاء المعنى</label>
+      <label><input type="checkbox" data-opt="trBilingual"> القواعد والمتطلبات بلغتين (الإنجليزية + النص العربي الأصلي بجانبها)</label>
+      <label><input type="checkbox" data-opt="trAutoGlossary"> استخراج قاموس المصطلحات من المستند تلقائياً</label>
+      <label><input type="checkbox" data-opt="trAppendGlossary"> إضافة القاموس (عربي = إنجليزي) في آخر الملف</label>
+      <label class="col">قاموسك الخاص — كلمة في كل سطر، وله الأولوية دائماً:
+        <textarea id="glossary" rows="5" dir="auto" spellcheck="false" placeholder="الكابتن = captain&#10;الطلب = order&#10;الزبون = customer&#10;المحفظة = wallet"></textarea>
+      </label>
+
+      <h3 class="sub">✨ تحسين المستند</h3>
+      <label class="row">نموذج التحسين (مع مفتاح API):
         <select data-opt="model">
           <option value="claude-haiku-5-5">Claude Haiku 5.5 — الأرخص والأسرع</option>
           <option value="claude-sonnet-5-5">Claude Sonnet 5.5 — متوازن</option>
@@ -87,6 +105,7 @@
     <div class="btns">
       <button data-bulk="project" class="primary">📦 حزمة Claude Code</button>
       <button data-bulk="claudemd">👁 CLAUDE.md</button>
+      <button data-bulk="translate" class="ai-btn">🌐 ترجمة الكل</button>
       <button data-bulk="save">⬇ ملف واحد مدموج</button>
       <button data-bulk="zip">🗂 كل ملف منفصل (ZIP)</button>
       <button data-bulk="copy">📋 نسخ المدموج</button>
@@ -116,6 +135,15 @@
     <button id="pvCopy">📋 نسخ</button>
     <button id="pvSave" class="primary">⬇ حفظ</button>
   </div>
+</dialog>
+
+<dialog id="compare">
+  <div class="dlg-head">
+    <strong id="cmpTitle">مقارنة الترجمة بالأصل</strong>
+    <span id="cmpStats"></span>
+    <button id="cmpClose" class="ghost" aria-label="إغلاق">✕</button>
+  </div>
+  <div id="cmpBody" class="cmp-body"></div>
 </dialog>
 
 <div id="toast" class="toast" hidden></div>

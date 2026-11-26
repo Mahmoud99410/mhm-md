@@ -1,13 +1,13 @@
 {
   "name": "mhm-md",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "MHM MD — convert PDF / Word / TXT into clean Markdown for Claude",
   "main": "main.js",
   "author": "Mahmoud",
   "license": "MIT",
   "scripts": {
     "start": "electron .",
-    "test": "node test/run.js",
+    "test": "node test/run.js && node test/translate.js",
     "build:win": "electron-builder --win portable nsis --publish never",
     "cap:sync": "cap sync android",
     "postinstall": "node scripts/copy-libs.js"

@@ -939,26 +939,53 @@
     if (!title && firstH) title = firstH[1].trim();
     if (!title) title = file.name.replace(/\.[^.]+$/, '');
 
+    meta.language = lang; meta.title = title;
+    const md = assemble(body, meta, opts);
+
+    const rawTokens = estTokens(rawText);
+    return {
+      name: file.name,
+      mdName: file.name.replace(/\.[^.]+$/, '') + '.md',
+      markdown: md,
+      body,
+      quality,
+      meta,
+      stats: {
+        rawTokens,
+        mdTokens: estTokens(md),
+        chars: md.length,
+        // Claude reads each PDF page as text + an image, roughly ≥1,500 extra tokens per page
+        pdfDirectTokens: ext === 'pdf' && meta.pages ? rawTokens + meta.pages * 1500 : null,
+      },
+    };
+  }
+
+  // Header (front matter, Claude note, key instructions, TOC) + body
+  function assemble(body, meta, opts) {
+    const unit = meta.format === 'PPTX' ? 'slides' : 'pages';
     const parts = [];
     if (opts.frontMatter) {
       if (opts.level === 'strong') {
-        parts.push(`> Source: ${file.name}${meta.pages ? ` (${meta.pages} ${ext === 'pptx' ? 'slides' : 'pages'})` : ''}`);
+        parts.push(`> Source: ${meta.source}${meta.pages ? ` (${meta.pages} ${unit})` : ''}${meta.translatedFrom ? ` · translated from ${meta.translatedFrom}` : ''}`);
       } else {
-        const fm = ['---', `source: ${file.name}`, `format: ${meta.format}`];
-        if (meta.pages) fm.push(`${ext === 'pptx' ? 'slides' : 'pages'}: ${meta.pages}`);
+        const fm = ['---', `source: ${meta.source}`, `format: ${meta.format}`];
+        if (meta.pages) fm.push(`${unit}: ${meta.pages}`);
         if (meta.sheets) fm.push(`sheets: ${meta.sheets}`);
-        fm.push(`title: ${title.replace(/\n/g, ' ')}`);
-        fm.push(`language: ${lang}`, '---');
+        fm.push(`title: ${String(meta.title || '').replace(/\n/g, ' ')}`);
+        fm.push(`language: ${meta.language}`);
+        if (meta.translatedFrom) fm.push(`translated_from: ${meta.translatedFrom}`);
+        fm.push('---');
         parts.push(fm.join('\n'));
       }
     }
     if (opts.claudeNote) {
+      const tr = meta.translatedFrom;
       parts.push(opts.noteLang === 'en'
-        ? '> **For Claude:** Full content of this file, converted to Markdown with its original structure. Read it completely and follow every instruction and requirement it contains.'
-        : '> **إلى Claude:** هذا المحتوى الكامل للملف بعد تحويله إلى Markdown مع الحفاظ على بنيته. اقرأه كاملاً والتزم بكل التعليمات والمتطلبات الواردة فيه.');
+        ? '> **For Claude:** Full content of this file, converted to Markdown with its original structure' + (tr ? ` and translated from ${tr} to English` : '') + '. Read it completely and follow every instruction and requirement it contains.'
+        : '> **إلى Claude:** هذا المحتوى الكامل للملف بعد تحويله إلى Markdown مع الحفاظ على بنيته' + (tr ? ' وترجمته إلى الإنجليزية' : '') + '. اقرأه كاملاً والتزم بكل التعليمات والمتطلبات الواردة فيه.');
     }
     if (opts.extractInstructions && estTokens(body) >= 600) {
-      const ins = extractInstructions(body, 40);
+      const ins = extractInstructions(body.replace(/\s*_\(AR: [^)]*\)_/g, '').replace(/^## Glossary[\s\S]*$/m, ''), 40);
       if (ins.length >= 2) {
         const head = opts.noteLang === 'en' ? '## Key instructions (extracted from the document)' : '## أهم التعليمات والمتطلبات (مستخرجة من المستند)';
         parts.push(head + '\n' + ins.map(s => '- ' + s).join('\n'));
@@ -970,24 +997,7 @@
     }
     if (parts.some(x => x.startsWith('## '))) parts.push('---');
     parts.push(body.trim());
-    const md = parts.join('\n\n') + '\n';
-
-    const rawTokens = estTokens(rawText);
-    return {
-      name: file.name,
-      mdName: file.name.replace(/\.[^.]+$/, '') + '.md',
-      markdown: md,
-      body,
-      quality,
-      meta: Object.assign(meta, { language: lang, title }),
-      stats: {
-        rawTokens,
-        mdTokens: estTokens(md),
-        chars: md.length,
-        // Claude reads each PDF page as text + an image, roughly ≥1,500 extra tokens per page
-        pdfDirectTokens: ext === 'pdf' && meta.pages ? rawTokens + meta.pages * 1500 : null,
-      },
-    };
+    return parts.join('\n\n') + '\n';
   }
 
   // ---------- multi-file helpers ----------
@@ -1205,8 +1215,272 @@
     return { files, claudeMd, index, totalTokens: total, removed };
   }
 
+  // ======================================================================
+  // Arabic → English translation (LLM injected: works with the Claude API
+  // in the apps and with the viewer's Claude account in the web version)
+  // ======================================================================
+  const AR_LETTERS = /[ء-ي]/;
+  const AR_NEG_RE = /(^|[\s(«"])(لا|ليس|ليست|لن|لم|ممنوع|يمنع|يُمنع|عدم|يحظر|يُحظر|بدون|دون|إلا|الا)(?=[\s.,،؛:!?؟)»"]|$)/g;
+  const EN_NEG_RE = /\b(not|never|no|without|cannot|can't|don't|doesn't|mustn't|shouldn't|isn't|aren't|won't|prohibited|forbidden|except|unless|only|nor|none)\b/gi;
+  const TR_RULE_RE = /(يجب|ينبغي|لا ?بد|يلزم|ممنوع|يمنع|يُمنع|مطلوب|ضروري|تأكد|احرص|التزم|اتبع|دائما|دائماً|أبدا|أبداً|إلزامي|الزامي|يحظر|يُحظر|لا ت[ء-ي]{2,}|لا ي[ء-ي]{2,}|عدم )/;
+
+  function parseGlossary(text) {
+    const out = [];
+    for (const line of String(text || '').split(/\n/)) {
+      const m = line.match(/^\s*(.+?)\s*(?:=|:|→|->)\s*(.+?)\s*$/);
+      if (m && AR_LETTERS.test(m[1]) && m[2]) out.push({ ar: m[1].trim(), en: m[2].trim() });
+    }
+    return out;
+  }
+  function mergeGlossary(user, auto) {
+    const map = new Map();
+    (auto || []).forEach(g => { if (g && g.ar && g.en && AR_LETTERS.test(g.ar)) map.set(String(g.ar).trim(), String(g.en).trim()); });
+    (user || []).forEach(g => map.set(g.ar, g.en)); // the user's terms always win
+    return [...map].map(([ar, en]) => ({ ar, en }));
+  }
+
+  // Replace code, URLs, e-mails and link targets with ⟦n⟧ so they are copied, never translated
+  function protect(md, markRules) {
+    const vault = [];
+    const put = v => { vault.push(v); return `⟦${vault.length - 1}⟧`; };
+    let out = md.replace(/```(?!csv)[\s\S]*?```/g, m => put(m));
+    out = out.replace(/`[^`\n]+`/g, m => put(m));
+    out = out.replace(/\]\(([^)\s]+)\)/g, (m, u) => '](' + put(u) + ')');
+    out = out.replace(/https?:\/\/[^\s)\]>"|]+/g, m => put(m));
+    out = out.replace(/[\w.+-]+@[\w-]+\.[\w.]+/g, m => put(m));
+    const rules = [];
+    if (markRules) {
+      out = out.split('\n').map(line => {
+        const t = line.trim();
+        if (!t || /^(#|\||```|---|>)/.test(t) || !AR_LETTERS.test(t) || !TR_RULE_RE.test(t) || rules.length >= 120) return line;
+        rules.push(t.replace(/^(-|\d+\.)\s+/, '').replace(/\*\*/g, '').replace(/⟦(\d+)⟧/g, (m, n) => vault[+n]));
+        const m = line.match(/^(\s*(?:-|\d+\.)\s+)?(.*)$/);
+        return (m[1] || '') + `⟦R${rules.length - 1}⟧ ` + m[2];
+      }).join('\n');
+    }
+    return { text: out, vault, rules };
+  }
+  function restore(text, vault, rules, bilingual) {
+    let out = text;
+    out = out.replace(/⟦R(\d+)⟧\s*(.*)$/gm, (m, n, rest) => {
+      const orig = rules[+n];
+      return bilingual && orig ? `${rest} _(AR: ${orig})_` : rest;
+    });
+    out = out.replace(/⟦(\d+)⟧/g, (m, n) => vault[+n] != null ? vault[+n] : m);
+    return out;
+  }
+
+  function splitChunks(md, maxTokens) {
+    const blocks = md.split(/\n{2,}/);
+    const chunks = [];
+    let cur = [];
+    let tok = 0;
+    for (const b of blocks) {
+      const t = estTokens(b);
+      if (cur.length && tok + t > maxTokens) { chunks.push(cur.join('\n\n')); cur = []; tok = 0; }
+      cur.push(b); tok += t;
+    }
+    if (cur.length) chunks.push(cur.join('\n\n'));
+    return chunks;
+  }
+
+  // Structural fingerprint used to verify a translated chunk
+  function fingerprint(t) {
+    const lines = t.split('\n');
+    const nums = (westernDigits(t.replace(/⟦R?\d+⟧/g, '')).match(/\d+(?:[.,]\d+)*/g) || []).map(n => n.replace(/,/g, ''));
+    return {
+      heads: lines.filter(l => /^#{1,6}\s/.test(l)).map(l => l.match(/^#+/)[0].length).join(','),
+      items: lines.filter(l => /^\s*(?:-|\d+\.)\s/.test(l)).length,
+      rows: lines.filter(l => /^\|/.test(l)).length,
+      csvLines: (t.match(/```csv[\s\S]*?```/g) || []).reduce((a, b) => a + b.split('\n').length, 0),
+      marks: (t.match(/⟦R?\d+⟧/g) || []).sort(),
+      nums,
+    };
+  }
+  function verifyChunk(src, out) {
+    const a = fingerprint(src), b = fingerprint(out);
+    const problems = [];
+    const missingMarks = a.marks.filter(m => !b.marks.includes(m));
+    if (missingMarks.length) problems.push({ kind: 'code', msg: `${missingMarks.length} protected item(s) (code/URL/rule marker) missing: ${missingMarks.slice(0, 5).join(' ')}` });
+    if (a.heads !== b.heads) problems.push({ kind: 'structure', msg: `headings differ (source ${a.heads || 'none'} vs translation ${b.heads || 'none'})` });
+    if (a.items !== b.items) problems.push({ kind: 'structure', msg: `list items differ (${a.items} vs ${b.items})` });
+    if (a.rows !== b.rows) problems.push({ kind: 'structure', msg: `table rows differ (${a.rows} vs ${b.rows})` });
+    if (a.csvLines !== b.csvLines) problems.push({ kind: 'structure', msg: `CSV table lines differ (${a.csvLines} vs ${b.csvLines})` });
+    const pool = b.nums.slice();
+    const missingNums = [];
+    for (const n of a.nums) { const k = pool.indexOf(n); if (k >= 0) pool.splice(k, 1); else missingNums.push(n); }
+    if (missingNums.length) problems.push({ kind: 'numbers', msg: `numbers missing in translation: ${missingNums.slice(0, 10).join(', ')}` });
+    const arNeg = (src.match(AR_NEG_RE) || []).length;
+    const enNeg = (out.match(EN_NEG_RE) || []).length;
+    if (arNeg >= 1 && enNeg < Math.ceil(arNeg * 0.6)) problems.push({ kind: 'negation', msg: `fewer negations in translation (${enNeg}) than in source (${arNeg}) — check prohibitions` });
+    const leftover = out.replace(/⟦R?\d+⟧/g, '').match(/[ء-ي][ء-ي\s]{3,}/g) || [];
+    if (leftover.length) problems.push({ kind: 'untranslated', msg: `untranslated Arabic left: «${leftover[0].trim().slice(0, 40)}»` });
+    const lenRatio = out.length / Math.max(1, src.length);
+    if (src.length > 400 && lenRatio < 0.55) problems.push({ kind: 'omission', msg: `translation is much shorter than the source (${Math.round(lenRatio * 100)}%) — content may be missing` });
+    return problems;
+  }
+  const severe = ps => ps.filter(p => ['code', 'structure', 'numbers', 'omission', 'untranslated'].includes(p.kind));
+
+  function translationPrompt(chunk, glossary, part, total, title) {
+    const g = glossary.length ? glossary.map(x => `- ${x.ar} = ${x.en}`).join('\n') : '(none)';
+    return [
+      'You are a senior Arabic→English technical translator for software projects. Translate the Markdown document part below into precise, natural technical English that a developer (and Claude Code) will implement from.',
+      '',
+      'Rules — follow all of them:',
+      '1. Translate the meaning exactly and completely. Do not summarize, add, omit, merge or reorder anything. Every sentence, list item and table cell must be translated.',
+      '2. Keep the Markdown structure identical: the same headings with the same # levels, the same list items and numbering, the same table rows and columns, the same CSV lines inside ```csv blocks, blockquotes and blank lines.',
+      '3. Copy these unchanged, exactly where they are: every marker like ⟦12⟧ or ⟦R3⟧ (keep a rule marker at the start of its line), all numbers, dates, times, prices, currencies, units, percentages, codes, IDs, file names and any English already present.',
+      '4. Glossary: translate each listed Arabic term with exactly its English term, every time. For other recurring terms, pick one English term and use it consistently.',
+      '5. Keep obligation and negation strength exactly: يجب/لا بد/يلزم/إلزامي → must; مطلوب → required; ينبغي/يُفضّل → should; يجوز/يمكن → may/can; يجب ألا/لا يجوز/لا يُسمح/ممنوع/يُمنع/يُحظر → must not; لا يجب بالضرورة/ليس من الضروري → does not have to; "لا ... إلا" → only. Never drop, add or move a negation.',
+      '6. Choose the software meaning from context: طلب = order (a ride/delivery/purchase) or request (HTTP/API); حساب = account or calculation; مستخدم = user; صلاحية = permission or validity; تطبيق = app or apply/implement; واجهة = interface/UI/screen or API; خادم = server; قاعدة بيانات = database; إشعار = notification.',
+      '7. Names: keep people and brand names; places in their standard English form (إربد = Irbid, عمّان = Amman, الزرقاء = Zarqa). Jordanian/colloquial words: translate the meaning; add the Arabic in parentheses only when no clear English equivalent exists.',
+      '8. If a sentence is ambiguous, translate it faithfully and append " [ambiguous in source]" — never guess silently.',
+      '9. Output ONLY the translated Markdown: no preface, no notes, no code fence around the whole output.',
+      '',
+      `Document: ${title || 'untitled'} — part ${part} of ${total}.`,
+      '',
+      'Glossary (Arabic = English):',
+      g,
+      '',
+      '<<<ARABIC_MARKDOWN',
+      chunk,
+      'ARABIC_MARKDOWN>>>',
+    ].join('\n');
+  }
+
+  function glossaryPrompt(sample) {
+    return [
+      'Read this Arabic document (a software / business specification, converted to Markdown).',
+      'List the domain terms that must be translated consistently into English: roles, entities, statuses, features, screens, business and local terms (up to 60).',
+      'For each, give the English term a developer would use in code and docs (e.g. الكابتن → captain, الطلب → order, المحفظة → wallet).',
+      'Do not list generic words. Reply with ONLY a JSON array like [{"ar":"الكابتن","en":"captain"}].',
+      '',
+      '<<<DOC',
+      sample,
+      'DOC>>>',
+    ].join('\n');
+  }
+
+  function reviewPrompt(src, tr) {
+    return [
+      'You are reviewing an Arabic→English translation of part of a software specification.',
+      'Compare ORIGINAL and TRANSLATION and report ONLY real meaning errors: a wrong, missing or added negation; wrong obligation strength (must/should/may/must not); a wrong or missing number, date, price or unit; omitted or added content; a wrong technical term; a mistranslated sentence. Ignore style and wording preferences. Markers like ⟦3⟧ are placeholders — ignore them.',
+      'Reply with ONLY JSON: {"issues":[{"wrong":"exact text copied from TRANSLATION","fix":"corrected English text to replace it","why":"short reason"}]}. "wrong" must be an exact substring of TRANSLATION (a full sentence or phrase). Use {"issues":[]} if the translation is accurate.',
+      '',
+      '<<<ORIGINAL', src, 'ORIGINAL>>>',
+      '',
+      '<<<TRANSLATION', tr, 'TRANSLATION>>>',
+    ].join('\n');
+  }
+
+  function parseJsonLoose(text) {
+    if (text && typeof text === 'object') return text;
+    const t = String(text || '').trim();
+    try { return JSON.parse(t); } catch (e) { /* continue */ }
+    const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fence) { try { return JSON.parse(fence[1]); } catch (e) { /* continue */ } }
+    const a = t.search(/[[{]/), b = Math.max(t.lastIndexOf(']'), t.lastIndexOf('}'));
+    if (a >= 0 && b > a) { try { return JSON.parse(t.slice(a, b + 1)); } catch (e) { /* give up */ } }
+    return null;
+  }
+  const stripFence = t => String(t || '').trim().replace(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```$/, '$1');
+
+  /**
+   * Translate an Arabic Markdown body to English.
+   * llm({prompt, json, tier, maxTokens, signal}) → Promise<string|object>
+   * opts: { glossary:[{ar,en}], autoGlossary, bilingualRules, review, appendGlossary, chunkTokens, onProgress, signal, title }
+   */
+  async function translateBody(body, llm, opts) {
+    opts = Object.assign({ autoGlossary: true, bilingualRules: true, review: false, appendGlossary: true, chunkTokens: 2500, tier: 'default' }, opts || {});
+    const progress = opts.onProgress || (() => {});
+    const report = { chunks: 0, retried: 0, reviewed: 0, fixes: 0, issues: [], glossary: [], calls: 0 };
+    const call = async (args) => { report.calls++; return llm(Object.assign({ tier: opts.tier, signal: opts.signal }, args)); };
+
+    // 1) glossary: the user's terms + terms Claude extracts from the document
+    let auto = [];
+    if (opts.autoGlossary) {
+      progress('استخراج قاموس المصطلحات من المستند…');
+      try {
+        const j = parseJsonLoose(await call({ prompt: glossaryPrompt(body.slice(0, 24000)), json: true, maxTokens: 3000 }));
+        if (Array.isArray(j)) auto = j;
+      } catch (e) { if (e && e.code === 'cancelled') throw e; report.issues.push({ part: 0, kind: 'glossary', msg: 'automatic glossary failed: ' + (e.message || e) }); }
+    }
+    const glossary = mergeGlossary(opts.glossary || [], auto);
+    report.glossary = glossary;
+
+    // 2) protect code/URLs, mark rule lines, split
+    const prot = protect(body, opts.bilingualRules);
+    const chunks = splitChunks(prot.text, opts.chunkTokens);
+    report.chunks = chunks.length;
+    const outChunks = [];
+    const pairs = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const src = chunks[i];
+      if (!AR_LETTERS.test(src.replace(/⟦R?\d+⟧/g, ''))) { outChunks.push(src); pairs.push({ src, out: src, problems: [] }); continue; }
+      const used = glossary.filter(g => src.includes(g.ar));
+      const maxTokens = Math.min(16000, Math.max(2000, Math.round(estTokens(src) * 1.6) + 500));
+      progress(`ترجمة الجزء ${i + 1} من ${chunks.length}…`);
+      let out = stripFence(await call({ prompt: translationPrompt(src, used, i + 1, chunks.length, opts.title), maxTokens }));
+      let problems = verifyChunk(src, out);
+      // 3) automatic retry with the exact problems when something important is off
+      if (severe(problems).length) {
+        report.retried++;
+        progress(`إعادة ترجمة الجزء ${i + 1} لتصحيح: ${severe(problems).map(p => p.kind).join('، ')}…`);
+        const fixPrompt = translationPrompt(src, used, i + 1, chunks.length, opts.title) +
+          '\n\nA previous translation of this part had these problems — avoid them:\n' + severe(problems).map(p => '- ' + p.msg).join('\n');
+        const out2 = stripFence(await call({ prompt: fixPrompt, maxTokens }));
+        const p2 = verifyChunk(src, out2);
+        if (severe(p2).length <= severe(problems).length) { out = out2; problems = p2; }
+      }
+      // 4) optional second pass: Claude reviews the meaning against the original
+      if (opts.review) {
+        progress(`مراجعة دقة الجزء ${i + 1} من ${chunks.length}…`);
+        try {
+          const j = parseJsonLoose(await call({ prompt: reviewPrompt(src, out), json: true, maxTokens: 4000 }));
+          report.reviewed++;
+          for (const it of (j && j.issues) || []) {
+            if (it && it.wrong && it.fix && out.includes(it.wrong) && it.wrong !== it.fix) {
+              out = out.replace(it.wrong, it.fix); report.fixes++;
+            } else if (it && it.why) {
+              problems.push({ kind: 'review', msg: `review: ${it.why}${it.wrong ? ` — «${String(it.wrong).slice(0, 60)}»` : ''}` });
+            }
+          }
+        } catch (e) { if (e && e.code === 'cancelled') throw e; problems.push({ kind: 'review', msg: 'review failed: ' + (e.message || e) }); }
+      }
+      problems.forEach(p => report.issues.push(Object.assign({ part: i + 1 }, p)));
+      outChunks.push(out);
+      pairs.push({ src: restore(src, prot.vault, prot.rules, false), out: restore(out, prot.vault, prot.rules, false), problems });
+    }
+
+    // 5) restore code/URLs and put the original Arabic next to every rule
+    let result = restore(outChunks.join('\n\n'), prot.vault, prot.rules, opts.bilingualRules);
+    const inDoc = glossary.filter(g => body.includes(g.ar));
+    if (opts.appendGlossary && inDoc.length) {
+      result = result.trim() + '\n\n## Glossary (Arabic → English)\n' + inDoc.map(g => `${g.ar} = ${g.en}`).join(' · ') + '\n';
+    }
+    return { body: result.trim() + '\n', report, pairs };
+  }
+
+  // Translate a converter result in place (keeps the original for undo)
+  async function translateResult(r, llm, options, convOpts) {
+    const res = await translateBody(r.body, llm, Object.assign({ title: r.meta.title }, options));
+    const meta = Object.assign({}, r.meta, { language: 'English', translatedFrom: 'Arabic' });
+    const copt = Object.assign({}, DEFAULTS, convOpts || {});
+    const titleLine = res.body.match(/^#\s+(.+)$/m);
+    if (titleLine) meta.title = titleLine[1].trim();
+    const md = assemble(res.body, meta, copt);
+    return {
+      original: { markdown: r.markdown, body: r.body, meta: r.meta, mdName: r.mdName, tokens: r.stats.mdTokens, quality: r.quality },
+      markdown: md, body: res.body, meta,
+      mdName: r.mdName.replace(/\.md$/, '.en.md'),
+      tokens: estTokens(md),
+      report: res.report, pairs: res.pairs,
+    };
+  }
+
   const api = {
-    init, convert, combine, buildProject, estTokens, DEFAULTS, SUPPORTED, extOf,
+    init, convert, combine, buildProject, estTokens, DEFAULTS, SUPPORTED, extOf, assemble,
+    translate: { translateBody, translateResult, parseGlossary, mergeGlossary, protect, restore, splitChunks, verifyChunk, parseJsonLoose, isArabic: t => detectLang(t) !== 'English' },
     _internal: { txtToBlocks, blocksToMd, finalize, extractInstructions, listInfo, compress, sectionize, detectTech, dedupeAcross, qualityReport },
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

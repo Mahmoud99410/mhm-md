@@ -102,24 +102,83 @@
     get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* ignore */ } },
   };
-  const opts = Object.assign({}, C.DEFAULTS, { model: 'claude-haiku-5-5' }, store.get('mhm-md-opts', {}));
+  const opts = Object.assign({}, C.DEFAULTS, {
+    model: 'claude-haiku-5-5',
+    trAuto: false, trQuality: 'default', trReview: true, trBilingual: true, trAutoGlossary: true, trAppendGlossary: true,
+  }, store.get('mhm-md-opts', {}));
   document.querySelectorAll('[data-opt]').forEach(el => {
     const k = el.dataset.opt;
     if (el.type === 'checkbox') el.checked = !!opts[k]; else el.value = opts[k];
     el.addEventListener('change', () => {
       opts[k] = el.type === 'checkbox' ? el.checked : el.value;
       store.set('mhm-md-opts', opts);
-      if (k !== 'model' && files.length) run(); // re-convert with new settings
+      if (k !== 'model' && !k.startsWith('tr') && files.length) run(); // re-convert with new settings
     });
   });
+  // ---------- Claude backend: viewer's Claude account (web artifact) or API key (apps) ----------
+  let sampleFn = null;
+  try { if (window.claude && window.claude.use) window.claude.use('sample').then(f => { sampleFn = f; syncKey(); }).catch(() => {}); } catch (e) { /* not an artifact */ }
+  const MODEL_BY_TIER = { quick: 'claude-haiku-5-5', default: 'claude-sonnet-5-5', complex: 'claude-opus-5-5' };
+  const hasAI = () => !!sampleFn || !!apiKeyEl.value.trim();
+
+  async function llm({ prompt, json, tier = 'default', maxTokens = 8000, signal, model }) {
+    if (sampleFn) {
+      try {
+        const o = { modelTier: tier, cache: false };
+        if (signal) o.signal = signal;
+        if (json) return await sampleFn.json(prompt, o);
+        const r = await sampleFn(prompt, o);
+        return r.text;
+      } catch (e) {
+        const err = new Error(sampleMsg(e)); err.code = e && e.code; throw err;
+      }
+    }
+    const key = apiKeyEl.value.trim();
+    if (!key) { const e = new Error('أضف مفتاح API في قسم «🤖 Claude» من الإعدادات'); e.code = 'no_key'; throw e; }
+    let res;
+    try {
+      res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST', signal,
+        headers: {
+          'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        body: JSON.stringify({ model: model || MODEL_BY_TIER[tier] || MODEL_BY_TIER.default, max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }] }),
+      });
+    } catch (e) {
+      const err = new Error(e && e.name === 'AbortError' ? 'أُوقف' : 'لا يمكن الاتصال بـ Claude API — تحقق من الإنترنت');
+      err.code = e && e.name === 'AbortError' ? 'cancelled' : 'network'; throw err;
+    }
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const m = (j.error && j.error.message) || ('HTTP ' + res.status);
+      const err = new Error(res.status === 401 ? 'مفتاح API غير صحيح' : res.status === 429 ? 'تجاوزت حد الاستخدام — انتظر قليلاً' : 'Claude API: ' + m);
+      err.code = 'api_' + res.status; throw err;
+    }
+    llm.usage += ((j.usage && (j.usage.input_tokens + j.usage.output_tokens)) || 0);
+    return (j.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
+  }
+  llm.usage = 0;
+  function sampleMsg(e) {
+    const c = e && e.code;
+    if (c === 'cancelled') return 'أُوقف';
+    if (c === 'not_granted' || c === 'sampling_disabled') return 'لم يُسمح باستخدام Claude في هذه الصفحة';
+    if (c === 'rate_limited') return 'تجاوزت حد الاستخدام في Claude — حاول لاحقاً';
+    if (c === 'prompt_too_large') return 'الجزء كبير جداً';
+    return 'Claude: ' + ((e && e.message) || c || 'خطأ');
+  }
+
   const apiKeyEl = $('#apiKey');
   apiKeyEl.value = store.get('mhm-md-key', '');
   const syncKey = () => {
     store.set('mhm-md-key', apiKeyEl.value.trim());
-    document.body.classList.toggle('has-key', !!apiKeyEl.value.trim()); // shows the ✨ buttons without re-rendering cards
+    document.body.classList.toggle('has-key', hasAI()); // shows the ✨/🌐 buttons without re-rendering cards
   };
   apiKeyEl.addEventListener('input', syncKey);
   syncKey();
+  const glossaryEl = $('#glossary');
+  glossaryEl.value = store.get('mhm-md-glossary', '');
+  glossaryEl.addEventListener('input', () => store.set('mhm-md-glossary', glossaryEl.value));
 
   // ---------- state ----------
   let files = [];    // {name, data:Uint8Array}
@@ -193,6 +252,12 @@
     }
     setStatus(`✅ تم تحويل ${results.length} من ${files.length} ملف` + (failed ? ` — تعذّر ${failed}` : ''));
     renderBulk();
+    if (opts.trAuto && hasAI()) {
+      for (let i = 0; i < results.length; i++) {
+        if (my !== runId) return;
+        if (isArabicDoc(results[i]) && !results[i].translated) await translate(i);
+      }
+    }
     console.log('MHM_DONE ' + JSON.stringify(results.map(r => ({ name: r.name, tokens: r.stats.mdTokens, ocr: (r.meta.ocrPages || []).length, head: r.body.slice(0, 80) }))));
   }
 
@@ -217,10 +282,11 @@
       const pct = Math.max(0, Math.round((1 - s.mdTokens / s.pdfDirectTokens) * 100));
       save = `<span class="save">توفير تقريبي ${pct}% مقارنة برفع الـPDF (~${fmt(s.pdfDirectTokens)})</span>`;
     }
-    const warns = r.quality.filter(q => q.type === 'warn').length;
-    const qItems = r.quality.map(q => `<li class="q-${q.type}">${q.type === 'warn' ? '⚠️' : q.type === 'info' ? 'ℹ️' : '✅'} ${esc(q.msg)}</li>`).join('');
+    const quality = r.quality.concat(r.trQuality || []);
+    const warns = quality.filter(q => q.type === 'warn').length;
+    const qItems = quality.map(q => `<li class="q-${q.type}">${q.type === 'warn' ? '⚠️' : q.type === 'info' ? 'ℹ️' : '✅'} ${esc(q.msg)}</li>`).join('');
     card.innerHTML = `
-      <div class="name"><span class="badge">${esc(r.meta.format)}</span><bdi dir="ltr">${esc(r.mdName)}</bdi>${r.improved ? '<span class="badge ai">✨ مُحسّن</span>' : ''}</div>
+      <div class="name"><span class="badge">${esc(r.meta.format)}</span><bdi dir="ltr">${esc(r.mdName)}</bdi>${r.improved ? '<span class="badge ai">✨ مُحسّن</span>' : ''}${r.translated ? '<span class="badge tr">🌐 EN</span>' : ''}</div>
       <div class="meta">
         ${r.meta.pages ? `<span>${r.meta.pages} ${r.meta.format === 'PPTX' ? 'شريحة' : 'صفحة'}</span>` : ''}
         ${r.meta.sheets ? `<span>${r.meta.sheets} ورقة</span>` : ''}
@@ -228,13 +294,16 @@
         <span>≈ ${fmt(s.mdTokens)} توكن</span>
         ${save}
       </div>
+      ${r.trState ? `<div class="tr-progress"><span class="tr-msg">⏳ ${esc(r.trState.msg)}</span><button data-a="stop">⏹ إيقاف</button></div>` : ''}
       <details class="quality"${warns ? ' open' : ''}><summary>تقرير الجودة${warns ? ` — ${warns} تنبيه` : ' — سليم'}</summary><ul>${qItems}</ul></details>
       <div class="btns">
         <button data-a="view">👁 معاينة وتعديل</button>
         <button data-a="copy">📋 نسخ</button>
         <button data-a="save" class="primary">⬇ حفظ</button>
         ${canShare() ? '<button data-a="share">↗ مشاركة</button>' : ''}
-        <button data-a="ai" class="ai-btn">${r.improved ? '↩ إلغاء التحسين' : '✨ تحسين بـ Claude'}</button>
+        ${isArabicDoc(r) || r.translated ? `<button data-a="tr" class="ai-btn"${r.trState ? ' disabled' : ''}>${r.translated ? '↩ الأصل العربي' : '🌐 ترجمة للإنجليزية'}</button>` : ''}
+        ${r.translated && r.trPairs ? '<button data-a="cmp">↔ مقارنة</button>' : ''}
+        <button data-a="ai" class="ai-btn"${r.trState ? ' disabled' : ''}>${r.improved ? '↩ إلغاء التحسين' : '✨ تحسين بـ Claude'}</button>
       </div>`;
     card.addEventListener('click', e => {
       const b = e.target.closest('button');
@@ -246,6 +315,9 @@
       if (a === 'save') saveFile(cur.mdName, cur.markdown);
       if (a === 'share') shareFile(cur.mdName, cur.markdown);
       if (a === 'ai') { if (cur.improved) undoImprove(idx); else improve(idx, b); }
+      if (a === 'tr') { if (cur.translated) undoTranslate(idx); else translate(idx); }
+      if (a === 'stop' && cur.trState && cur.trState.ctl) cur.trState.ctl.abort();
+      if (a === 'cmp') openCompare(cur);
     });
     const old = $('#results').querySelector(`.card[data-idx="${idx}"]`);
     if (old) old.replaceWith(card); else $('#results').appendChild(card);
@@ -281,6 +353,13 @@
       const name = (results.length === 1 ? results[0].name.replace(/\.[^.]+$/, '') : 'project') + '-claude-code.zip';
       await saveBinary(name, await zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE' }));
       toast(`الحزمة: CLAUDE.md + ${p.files.length - 1} ملف داخل docs/ (~${fmt(p.totalTokens)} توكن)`);
+      return;
+    }
+    if (a === 'translate') {
+      if (!hasAI()) { toast('أضف مفتاح API في قسم «🤖 Claude» من الإعدادات'); return; }
+      const todo = results.map((r, i) => i).filter(i => isArabicDoc(results[i]) && !results[i].translated && !results[i].trState);
+      if (!todo.length) { toast('لا توجد ملفات عربية تحتاج ترجمة'); return; }
+      for (const i of todo) await translate(i);
       return;
     }
     if (a === 'claudemd') {
@@ -332,41 +411,103 @@
 
   async function improve(idx, btn) {
     const r = results[idx];
-    const key = apiKeyEl.value.trim();
-    if (!key) { toast('أدخل مفتاح API في الإعدادات أولاً'); return; }
+    if (!hasAI()) { toast('أضف مفتاح API في قسم «🤖 Claude» من الإعدادات'); return; }
     if (r.stats.mdTokens > 60000) { toast('المستند كبير جداً للتحسين دفعة واحدة — استخدم حزمة Claude Code'); return; }
     btn.disabled = true; btn.textContent = '⏳ Claude يعمل…';
     try {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01',
-          'anthropic-dangerous-direct-browser-access': 'true',
-        },
-        body: JSON.stringify({
-          model: opts.model || 'claude-haiku-5-5',
-          max_tokens: Math.min(32000, Math.max(4000, Math.round(r.stats.mdTokens * 1.3))),
-          system: AI_SYSTEM,
-          messages: [{ role: 'user', content: `File: ${r.name}\n\n${r.markdown}` }],
-        }),
+      const before = llm.usage;
+      const text = await llm({
+        prompt: AI_SYSTEM + `\n\nFile: ${r.name}\n\n<<<DOCUMENT\n${r.markdown}\nDOCUMENT>>>`,
+        tier: 'default', model: opts.model,
+        maxTokens: Math.min(32000, Math.max(4000, Math.round(r.stats.mdTokens * 1.3))),
       });
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error((j.error && j.error.message) || ('HTTP ' + res.status));
-      const text = (j.content || []).filter(c => c.type === 'text').map(c => c.text).join('').trim();
-      if (!text) throw new Error('رد فارغ');
+      const out = String(text || '').trim();
+      if (!out) throw new Error('رد فارغ');
       r.original = { markdown: r.markdown, body: r.body, tokens: r.stats.mdTokens };
-      r.markdown = text.replace(/^```(?:markdown|md)?\n([\s\S]*)\n```$/, '$1') + '\n';
+      r.markdown = out.replace(/^```(?:markdown|md)?\n([\s\S]*)\n```$/, '$1') + '\n';
       r.body = r.markdown;
       r.stats.mdTokens = C.estTokens(r.markdown);
       r.improved = true;
-      const used = j.usage ? ` (استُهلك ${fmt(j.usage.input_tokens + j.usage.output_tokens)} توكن API)` : '';
-      toast((j.stop_reason === 'max_tokens' ? 'تنبيه: الرد اقتُطع — راجع النهاية' : 'تم التحسين ✓') + used);
+      const used = llm.usage - before;
+      toast('تم التحسين ✓' + (used ? ` (استُهلك ${fmt(used)} توكن API)` : ''));
     } catch (err) {
-      const m = String((err && err.message) || err);
-      toast(/Failed to fetch|NetworkError|Content Security|Load failed/i.test(m) ? 'لا يمكن الاتصال بـ Claude API من هنا — استخدم تطبيق الهاتف أو الكمبيوتر' : 'فشل التحسين: ' + m);
+      toast('فشل التحسين: ' + (err.message || err));
     }
     renderCard(idx); renderBulk();
   }
+
+  // ---------- 🌐 translate Arabic → English ----------
+  function isArabicDoc(r) { return r && /Arabic/.test((r.translated ? r.trOriginal.meta.language : r.meta.language) || ''); }
+
+  async function translate(idx) {
+    const r = results[idx];
+    if (!hasAI()) { toast('الترجمة تحتاج مفتاح API — أضفه في قسم «🤖 Claude» من الإعدادات'); $('#aiOpts').open = true; return; }
+    if (r.improved) undoImprove(idx);
+    const ctl = new AbortController();
+    r.trState = { msg: 'بدء الترجمة…', ctl };
+    renderCard(idx);
+    const setMsg = m => {
+      r.trState.msg = m;
+      const el = $('#results').querySelector(`.card[data-idx="${idx}"] .tr-msg`);
+      if (el) el.textContent = '⏳ ' + m; else renderCard(idx);
+    };
+    const before = llm.usage;
+    try {
+      const tr = await C.translate.translateResult(r, llm, {
+        glossary: C.translate.parseGlossary(glossaryEl.value),
+        autoGlossary: opts.trAutoGlossary, bilingualRules: opts.trBilingual, review: opts.trReview,
+        appendGlossary: opts.trAppendGlossary, tier: opts.trQuality || 'default',
+        signal: ctl.signal, onProgress: setMsg,
+      }, opts);
+      r.trOriginal = tr.original;
+      r.markdown = tr.markdown; r.body = tr.body; r.meta = tr.meta; r.mdName = tr.mdName;
+      r.stats.mdTokens = tr.tokens;
+      r.trPairs = tr.pairs;
+      r.translated = true;
+      const rep = tr.report;
+      const q = [];
+      const realIssues = rep.issues.filter(i => i.kind !== 'review');
+      q.push({ type: 'ok', msg: `الترجمة: ${rep.chunks} جزء · قاموس ${rep.glossary.length} مصطلح${rep.retried ? ` · أُعيدت ترجمة ${rep.retried} جزء تلقائياً` : ''}${rep.reviewed ? ` · المراجعة صحّحت ${rep.fixes} موضع` : ''}` });
+      if (!realIssues.length) q.push({ type: 'ok', msg: 'فحص الترجمة: كل الأرقام والكود والروابط والعناوين والقوائم والجداول مطابقة للأصل' });
+      const AR_KIND = { numbers: 'أرقام', code: 'كود/روابط', structure: 'البنية', negation: 'النفي', untranslated: 'نص غير مترجم', omission: 'نقص محتمل', glossary: 'القاموس' };
+      realIssues.forEach(i => q.push({ type: 'warn', msg: `ترجمة — الجزء ${i.part}، ${AR_KIND[i.kind] || i.kind}: ${i.msg}` }));
+      rep.issues.filter(i => i.kind === 'review').forEach(i => q.push({ type: 'info', msg: `ملاحظة المراجعة — الجزء ${i.part}: ${i.msg}` }));
+      r.trQuality = q;
+      const used = llm.usage - before;
+      toast(realIssues.length ? `تمت الترجمة مع ${realIssues.length} تنبيه — راجع «مقارنة»` : 'تمت الترجمة ✓' + (used ? ` (استُهلك ${fmt(used)} توكن API)` : ''));
+    } catch (err) {
+      toast(err && err.code === 'cancelled' ? 'أُوقفت الترجمة' : 'فشلت الترجمة: ' + ((err && err.message) || err));
+    }
+    r.trState = null;
+    renderCard(idx); renderBulk();
+  }
+
+  function undoTranslate(idx) {
+    const r = results[idx];
+    if (!r.trOriginal) return;
+    const o = r.trOriginal;
+    r.markdown = o.markdown; r.body = o.body; r.meta = o.meta; r.mdName = o.mdName; r.stats.mdTokens = o.tokens;
+    r.translated = false; r.trOriginal = null; r.trPairs = null; r.trQuality = null;
+    renderCard(idx); renderBulk();
+  }
+
+  // side-by-side review of every translated part
+  const cmp = $('#compare');
+  function openCompare(r) {
+    const pairs = r.trPairs || [];
+    const probs = pairs.reduce((a, p) => a + p.problems.filter(x => x.kind !== 'review').length, 0);
+    $('#cmpTitle').textContent = 'مقارنة: ' + r.trOriginal.mdName + ' ↔ ' + r.mdName;
+    $('#cmpStats').textContent = `${pairs.length} جزء · ${probs ? probs + ' تنبيه' : 'بدون تنبيهات'}`;
+    $('#cmpBody').innerHTML = pairs.map((p, i) => `
+      <div class="cmp-pair">
+        <div class="head"><span>الجزء ${i + 1}</span><span>${p.problems.length ? '⚠️ ' + p.problems.length : '✅'}</span></div>
+        ${p.problems.length ? `<ul class="probs">${p.problems.map(x => `<li>${esc(x.msg)}</li>`).join('')}</ul>` : ''}
+        <div class="cols"><pre class="ar" dir="rtl">${esc(p.src)}</pre><pre dir="ltr">${esc(p.out)}</pre></div>
+      </div>`).join('');
+    if (cmp.showModal) cmp.showModal(); else cmp.setAttribute('open', '');
+  }
+  $('#cmpClose').addEventListener('click', () => { if (cmp.close) cmp.close(); else cmp.removeAttribute('open'); });
+
   function undoImprove(idx) {
     const r = results[idx];
     if (!r.original) return;
