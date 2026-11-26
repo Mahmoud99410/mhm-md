@@ -24,7 +24,7 @@
   function loadScript(src) {
     return new Promise((res, rej) => {
       const s = document.createElement('script');
-      s.src = src; s.onload = res; s.onerror = () => rej(new Error('تعذّر تحميل ' + src));
+      s.src = src; s.onload = res; s.onerror = () => rej(new Error('OCR غير متاح في هذه النسخة — استخدم تطبيق الهاتف أو الكمبيوتر'));
       document.head.appendChild(s);
     });
   }
@@ -38,7 +38,8 @@
         workerPath: abs('lib/ocr/worker.min.js'),
         corePath: abs('lib/ocr/core'),
         langPath: abs('lib/ocr/lang'),
-        gzip: true, cacheMethod: 'none', workerBlobURL: false,
+        // the Android build unpacks .gz assets, so the app ships plain .traineddata files there
+        gzip: !isNative, cacheMethod: 'none', workerBlobURL: false,
       });
     })();
     ocrWorkerP.catch(() => { ocrWorkerP = null; });

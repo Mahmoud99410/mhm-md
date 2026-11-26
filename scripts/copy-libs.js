@@ -22,4 +22,10 @@ for (const [dst, src] of Object.entries(files)) {
   fs.mkdirSync(path.dirname(to), { recursive: true });
   fs.copyFileSync(nm(src), to);
 }
+// SheetJS ships raw control characters inside string literals; escape them so the file is plain UTF-8 text
+{
+  const f = path.join(out, 'xlsx.full.min.js');
+  const src = fs.readFileSync(f, 'utf8');
+  fs.writeFileSync(f, src.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, c => '\\x' + c.charCodeAt(0).toString(16).padStart(2, '0')));
+}
 console.log(`copied ${Object.keys(files).length} library files to www/lib`);
