@@ -43,7 +43,7 @@
       .trim();
   }
 
-  const BULLET_RE = /^\s*(?:[•●▪◦○■□➢➤►▶✓✔·\uF0B7\uF0A7\uF0D8\uF076\uF0FC]\s*|[-–—*+]\s+)/;
+  const BULLET_RE = /^\s*(?:٠(?=\s+[\u0621-\u064A])\s*|[•●▪◦○■□➢➤►▶✓✔·\uF0B7\uF0A7\uF0D8\uF076\uF0FC]\s*|[-–—*+]\s+)/;
   const NUM_RE = /^\s*(?:(\d{1,3}|[٠-٩]{1,3})[.)\-]|\(\s*(\d{1,3}|[٠-٩]{1,3}|[a-z]|[أ-ي])\s*\)|([a-z]|[أ-ي])\))\s+/;
 
   function listInfo(text) {
@@ -72,6 +72,7 @@
       isEvalSupported: false, useSystemFonts: true, disableFontFace: true,
     }).promise;
     meta.pages = doc.numPages;
+    meta.ocrPages = []; meta.emptyPages = [];
     try {
       const info = await doc.getMetadata();
       const t = info && info.info && info.info.Title ? String(info.info.Title).replace(/^Microsoft (Word|PowerPoint) - /i, '').trim() : '';
@@ -101,6 +102,22 @@
         }
       } catch (e) { /* fonts unavailable */ }
 
+      const pageChars = tc.items.reduce((a, it) => a + (it.str ? it.str.trim().length : 0), 0);
+      if (pageChars < 25 && opts.ocr && LIB.ocr && LIB.createCanvas) {
+        try {
+          const scale = Math.min(3, 2200 / Math.max(vp.width, vp.height));
+          const v2 = page.getViewport({ scale });
+          const canvas = LIB.createCanvas(Math.ceil(v2.width), Math.ceil(v2.height));
+          await page.render({ canvasContext: canvas.getContext('2d'), viewport: v2 }).promise;
+          if (LIB.progress) LIB.progress(`OCR: صفحة ${p} من ${doc.numPages}`);
+          const text = await LIB.ocr(canvas);
+          pages.push({ items: [], lines: [], width: vp.width, height: vp.height, ocrText: text || '' });
+          meta.ocrPages.push(p);
+          totalChars += (text || '').length;
+          continue;
+        } catch (e) { meta.ocrFailed = (e && e.message) || String(e); }
+      }
+      if (pageChars < 25) meta.emptyPages.push(p);
       const items = [];
       for (const it of tc.items) {
         if (!it.str || !it.str.trim()) continue;
@@ -112,7 +129,7 @@
       pages.push({ items, width: vp.width, height: vp.height, lines: groupLines(items) });
       page.cleanup && page.cleanup();
     }
-    if (totalChars < 20 * Math.max(1, doc.numPages) && totalChars < 200) {
+    if (meta.emptyPages.length && meta.emptyPages.length >= doc.numPages * 0.5 && totalChars < 200 * doc.numPages) {
       meta.scanned = true;
     }
     return linesToBlocks(pages, opts, meta);
@@ -294,6 +311,11 @@
     }
 
     for (let pi = 0; pi < pages.length; pi++) {
+      if (pages[pi].ocrText != null) {
+        flush();
+        blocks.push(...txtToBlocks(pages[pi].ocrText, opts, true));
+        continue;
+      }
       const lines = pages[pi].lines;
       for (let i = 0; i < lines.length; i++) {
         const l = lines[i];
@@ -453,12 +475,31 @@
         walk(node);
         const data = rows.map(tr => Array.from(tr.childNodes)
           .filter(td2 => /^(TD|TH)$/.test(td2.nodeName))
-          .map(cell => cleanInline(td.turndown(cell.innerHTML || '').replace(/\n+/g, ' ')).replace(/\|/g, '\\|')));
-        return '\n\n' + tableMd(data) + '\n\n';
+          .map(cell => cleanInline(td.turndown(cell.innerHTML || '').replace(/\n+/g, ' '))));
+        return '\n\n' + tableOut(data) + '\n\n';
       },
     });
     td.addRule('cellOnly', { filter: ['td', 'th', 'tr', 'thead', 'tbody'], replacement: c => c });
     return td;
+  }
+
+  // Table output: Markdown table, or CSV (cheaper) for wide/long tables depending on compression level
+  let CUR = {};
+  function tableOut(rows) {
+    rows = rows.map(r => r.map(c => cleanInline(String(c == null ? '' : c)))).filter(r => r.some(c => c));
+    if (!rows.length) return '';
+    const n = Math.max(...rows.map(r => r.length));
+    // drop columns that are empty in every row
+    const keep = [];
+    for (let k = 0; k < n; k++) if (rows.some(r => r[k])) keep.push(k);
+    rows = rows.map(r => keep.map(k => r[k] || ''));
+    const cols = keep.length;
+    const lvl = CUR.level || 'medium';
+    if (lvl === 'strong' || (lvl === 'medium' && (cols >= 6 || rows.length >= 20))) {
+      const q = c => /[",\n]/.test(c) ? '"' + c.replace(/"/g, '""') + '"' : c;
+      return '```csv\n' + rows.map(r => r.map(q).join(',')).join('\n') + '\n```';
+    }
+    return tableMd(rows.map(r => r.map(c => c.replace(/\|/g, '\\|'))));
   }
 
   function tableMd(rows) {
@@ -474,7 +515,7 @@
   async function docxToMd(data, opts, meta) {
     const mammoth = LIB.mammoth;
     if (!mammoth) throw new Error('Word library not loaded');
-    const input = (typeof Buffer !== 'undefined' && data instanceof Buffer) ? { buffer: data } : { arrayBuffer: data.buffer ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : data };
+    const input = (typeof window === 'undefined' && typeof Buffer !== 'undefined') ? { buffer: Buffer.from(data) } : { arrayBuffer: data.buffer ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : data };
     const res = await mammoth.convertToHtml(input, {
       styleMap: [
         "p[style-name='Title'] => h1:fresh",
@@ -492,7 +533,7 @@
   function htmlToMd(html, opts) { return makeTurndown(opts).turndown(html); }
 
   // ---------- TXT ----------
-  function txtToBlocks(text, opts) {
+  function txtToBlocks(text, opts, fromOcr) {
     const lines = text.replace(/\r\n?/g, '\n').split('\n');
     const chunks = [];
     let cur = [];
@@ -513,6 +554,9 @@
       }
       if (opts.stripToc && ch.every(l => TOC_LINE_RE.test(l))) continue;
       let start = 0;
+      // markdown heading lines ("## Title") keep their level
+      const mh = ch.length === 1 && ch[0].match(/^\s*(#{1,6})\s+(.+)$/);
+      if (mh) { blocks.push({ type: 'h', level: mh[1].length, text: cleanInline(mh[2]) }); continue; }
       // single-line heading chunk
       if (ch.length === 1 && isTxtHeading(ch[0], chunks[ci + 1])) {
         const t = cleanInline(ch[0]);
@@ -527,7 +571,7 @@
       }
       let para = null;
       const avgLen = ch.reduce((a, l) => a + l.length, 0) / ch.length;
-      const unwrap = avgLen > 55;
+      const unwrap = fromOcr || avgLen > 55;
       for (let i = start; i < ch.length; i++) {
         const t = cleanInline(ch[i]);
         if (opts.stripToc && TOC_LINE_RE.test(t)) continue;
@@ -572,7 +616,7 @@
       else cell += c;
     }
     if (cell || row.length) { row.push(cell); rows.push(row); }
-    return tableMd(rows.map(r => r.map(c => cleanInline(c).replace(/\|/g, '\\|'))));
+    return tableOut(rows);
   }
 
   // ---------- blocks -> markdown ----------
@@ -586,7 +630,7 @@
       else if (b.type === 'li') {
         const ind = b.indent ? '  ' : '';
         s = ind + (b.ordered ? `${b.num}. ` : '- ') + (b.label ? b.label + ' ' : '') + b.text;
-      } else if (b.type === 'table') s = tableMd(b.rows.map(r => r.map(c => c.replace(/\|/g, '\\|'))));
+      } else if (b.type === 'table') s = tableOut(b.rows);
       else if (b.type === 'code') s = '```\n' + b.text + '\n```';
       if (!s.trim()) continue;
       const tight = b.type === 'li' && prevType === 'li';
@@ -659,8 +703,167 @@
     }).join('\n');
   }
 
+  // ---------- PowerPoint (.pptx) ----------
+  function xmlUnesc(t) {
+    return t.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+      .replace(/&#x([0-9a-f]+);/gi, (m, h) => String.fromCodePoint(parseInt(h, 16)))
+      .replace(/&#(\d+);/g, (m, d) => String.fromCodePoint(+d)).replace(/&amp;/g, '&');
+  }
+  function xmlParas(xml) {
+    const out = [];
+    const re = /<a:p(?:\s[^>]*)?>([\s\S]*?)<\/a:p>/g;
+    let m;
+    while ((m = re.exec(xml))) {
+      const inner = m[1];
+      const text = cleanInline(xmlUnesc((inner.match(/<a:t>([\s\S]*?)<\/a:t>|<a:t\s[^>]*>([\s\S]*?)<\/a:t>/g) || [])
+        .map(t => t.replace(/<\/?a:t[^>]*>/g, '')).join('')));
+      const lvl = +((inner.match(/<a:pPr[^>]*\blvl="(\d)"/) || [])[1] || 0);
+      if (text) out.push({ text, lvl });
+    }
+    return out;
+  }
+  async function pptxToMd(data, opts, meta) {
+    const JSZip = LIB.JSZip;
+    if (!JSZip) throw new Error('ZIP library not loaded');
+    const zip = await JSZip.loadAsync(data);
+    const read = p => zip.file(p) ? zip.file(p).async('string') : Promise.resolve('');
+    // slide order from presentation.xml
+    let order = [];
+    try {
+      const pres = await read('ppt/presentation.xml');
+      const rels = await read('ppt/_rels/presentation.xml.rels');
+      const relMap = {};
+      (rels.match(/<Relationship\s[^>]*>/g) || []).forEach(r => {
+        const id = (r.match(/Id="([^"]+)"/) || [])[1], tg = (r.match(/Target="([^"]+)"/) || [])[1];
+        if (id && tg) relMap[id] = 'ppt/' + tg.replace(/^\/?ppt\//, '').replace(/^\.\.\//, '');
+      });
+      order = (pres.match(/<p:sldId\s[^>]*>/g) || []).map(t => relMap[(t.match(/r:id="([^"]+)"/) || [])[1]]).filter(Boolean);
+    } catch (e) { /* fallback below */ }
+    if (!order.length) {
+      order = Object.keys(zip.files).filter(f => /^ppt\/slides\/slide\d+\.xml$/.test(f))
+        .sort((a, b) => +a.match(/(\d+)\.xml/)[1] - +b.match(/(\d+)\.xml/)[1]);
+    }
+    meta.pages = order.length;
+    const parts = [];
+    for (let i = 0; i < order.length; i++) {
+      const xml = await read(order[i]);
+      let title = '';
+      const lines = [];
+      const shapes = xml.match(/<p:sp(?:\s[^>]*)?>[\s\S]*?<\/p:sp>|<p:graphicFrame(?:\s[^>]*)?>[\s\S]*?<\/p:graphicFrame>/g) || [];
+      for (const sh of shapes) {
+        if (/<a:tbl>/.test(sh)) {
+          const rows = (sh.match(/<a:tr[\s>][\s\S]*?<\/a:tr>/g) || []).map(tr =>
+            (tr.match(/<a:tc(?:\s[^>]*)?>[\s\S]*?<\/a:tc>|<a:tc[^>]*\/>/g) || []).map(tc => xmlParas(tc).map(p => p.text).join(' ')));
+          if (rows.length) lines.push(tableOut(rows));
+          continue;
+        }
+        const ph = (sh.match(/<p:ph\s[^>]*type="([^"]+)"/) || [])[1] || '';
+        const paras = xmlParas(sh);
+        if (!paras.length) continue;
+        if (/^(title|ctrTitle)$/.test(ph) && !title) { title = paras.map(p => p.text).join(' '); continue; }
+        if (ph === 'sldNum' || ph === 'dt' || ph === 'ftr') continue;
+        if (paras.length === 1 && ph !== 'body') { lines.push(paras[0].text); continue; }
+        for (const p of paras) lines.push('  '.repeat(Math.min(p.lvl, 3)) + '- ' + p.text.replace(BULLET_RE, ''));
+      }
+      if (opts.slideNotes !== false) {
+        try {
+          const rel = await read(order[i].replace(/slides\/(slide\d+\.xml)$/, 'slides/_rels/$1.rels'));
+          const nt = (rel.match(/Target="\.\.\/notesSlides\/(notesSlide\d+\.xml)"/) || [])[1];
+          if (nt) {
+            const nx = await read('ppt/notesSlides/' + nt);
+            const body = (nx.match(/<p:sp(?:\s[^>]*)?>[\s\S]*?<\/p:sp>/g) || []).filter(sp => /type="body"/.test(sp));
+            const notes = body.map(sp => xmlParas(sp).map(p => p.text).join(' ')).join(' ').trim();
+            if (notes) lines.push('\n> ' + (opts.noteLang === 'en' ? 'Notes: ' : 'ملاحظات: ') + notes);
+          }
+        } catch (e) { /* no notes */ }
+      }
+      if (i === 0 && title) meta.title = title;
+      parts.push(`## ${i + 1}. ${title || (opts.noteLang === 'en' ? 'Slide' : 'شريحة')}` + (lines.length ? '\n\n' + lines.join('\n') : ''));
+    }
+    return parts.join('\n\n');
+  }
+
+  // ---------- Excel (.xlsx / .xls / .ods) ----------
+  function sheetToMd(data, opts, meta) {
+    const XLSX = LIB.XLSX;
+    if (!XLSX) throw new Error('Excel library not loaded');
+    const wb = XLSX.read(data instanceof Uint8Array ? data : new Uint8Array(data), { type: 'array', cellDates: true });
+    meta.sheets = wb.SheetNames.length;
+    const parts = [];
+    const MAX = 3000;
+    for (const name of wb.SheetNames) {
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, raw: false, blankrows: false, defval: '' });
+      if (!rows.length) continue;
+      const cut = rows.length > MAX;
+      parts.push(`## ${name}\n\n` + tableOut(rows.slice(0, MAX)) + (cut ? `\n\n> … ${rows.length - MAX} more rows not included` : ''));
+    }
+    return parts.join('\n\n');
+  }
+
+  // ---------- compression ----------
+  const BOILER_RE = /^(?:©|\(c\)\s|copyright\b|all rights reserved|confidential\b|proprietary and confidential|this page (?:is )?intentionally left blank|جميع الحقوق محفوظة|حقوق (?:النشر|الطبع)|سري(?: للغاية)?$|هذه الصفحة (?:تُركت|تركت) فارغة)/i;
+  function cleanUrl(u) {
+    try {
+      const x = new URL(u);
+      [...x.searchParams.keys()].forEach(k => { if (/^(utm_|fbclid|gclid|mc_|igshid|_hs|ref_src|si$|spm$)/i.test(k)) x.searchParams.delete(k); });
+      let out = x.toString();
+      if (out.endsWith('/') && !u.endsWith('/')) out = out.slice(0, -1);
+      return out;
+    } catch (e) { return u; }
+  }
+  function compress(md, opts) {
+    const lvl = opts.level || 'medium';
+    if (lvl === 'light') return md;
+    const seen = new Set();
+    let inCode = false;
+    const out = [];
+    for (let l of md.split('\n')) {
+      if (/^```/.test(l)) { inCode = !inCode; out.push(l); continue; }
+      if (inCode) { out.push(l); continue; }
+      const t = l.trim();
+      if (t && t.length < 160 && (BOILER_RE.test(t) || /all rights reserved|جميع الحقوق محفوظة/i.test(t))) continue;
+      l = l.replace(/https?:\/\/[^\s)\]>"]+/g, cleanUrl);
+      if (lvl === 'strong') {
+        l = l.replace(/\*\*([^*\n]+)\*\*/g, '$1').replace(/(^|[\s(])\*([^*\s][^*\n]*?)\*(?=[\s).,:;!?]|$)/g, '$1$2');
+        l = l.replace(/!?\[([^\]]*)\]\(([^)\s]+)\)/g, (m, txt, url) => txt.trim() ? txt : url);
+        if (/^\[صورة(?::[^\]]*)?\]$|^\[image(?::[^\]]*)?\]$/i.test(t)) continue;
+        if (t.length >= 40 && !/^[|#]/.test(t)) {
+          const k = t.toLowerCase();
+          if (seen.has(k)) continue;
+          seen.add(k);
+        }
+      }
+      out.push(l);
+    }
+    return out.join('\n').replace(/\n{3,}/g, '\n\n');
+  }
+
+  // ---------- quality report ----------
+  function qualityReport(body, meta, opts) {
+    const W = [];
+    const lang = opts.noteLang;
+    const pageList = a => a.length > 12 ? a.slice(0, 12).join(', ') + '…' : a.join(', ');
+    if (meta.scanned && !(meta.ocrPages && meta.ocrPages.length)) W.push({ type: 'warn', msg: 'الـPDF ممسوح ضوئياً (صور بدون نص) — فعّل خيار OCR لقراءته' });
+    else if (meta.emptyPages && meta.emptyPages.length) W.push({ type: 'warn', msg: `صفحات بدون نص (قد تكون صوراً أو مخططات): ${pageList(meta.emptyPages)}` });
+    if (meta.ocrPages && meta.ocrPages.length) W.push({ type: 'info', msg: `قُرئت بالـOCR الصفحات: ${pageList(meta.ocrPages)} — راجع الأرقام والأسماء` });
+    if (meta.ocrFailed) W.push({ type: 'warn', msg: 'تعذّر تشغيل OCR: ' + meta.ocrFailed });
+    const words = body.match(/[ء-ي]{2,}/g) || [];
+    const bad = words.filter(w => /^[ةى]/.test(w) || /ة[ء-ي]/.test(w)).length;
+    if (words.length > 20 && bad / words.length > 0.03) W.push({ type: 'warn', msg: 'جزء من النص العربي قد يكون مقلوباً أو متقطعاً (مشكلة في خطوط الـPDF) — راجعه' });
+    if (/�/.test(body)) W.push({ type: 'warn', msg: 'توجد رموز غير مقروءة (مشكلة ترميز أو خط)' });
+    const heads = (body.match(/^#{1,6}\s/gm) || []).length;
+    const tables = (body.match(/^\| ?---/gm) || []).length + (body.match(/^```csv/gm) || []).length;
+    const lists = (body.match(/^\s*(?:-|\d+\.)\s/gm) || []).length;
+    const tok = estTokens(body);
+    if (!heads && tok > 1500) W.push({ type: 'warn', msg: 'لم يُعثر على عناوين — البنية مسطحة، قد تحتاج تقسيماً يدوياً' });
+    if (tok > 40000) W.push({ type: 'info', msg: 'مستند كبير — الأفضل استخدام «حزمة Claude Code» لتقسيمه حتى يقرأ Claude الجزء المطلوب فقط' });
+    W.unshift({ type: 'ok', msg: `البنية: ${heads} عنوان · ${lists} عنصر قائمة · ${tables} جدول` });
+    return W;
+  }
+
   // ---------- main ----------
   const DEFAULTS = {
+    level: 'medium', ocr: true, slideNotes: true,
     stripHeaders: true, stripToc: true, dedupe: true, imagePlaceholders: true,
     frontMatter: true, claudeNote: true, extractInstructions: true, toc: false,
     noteLang: 'en',
@@ -676,8 +879,12 @@
     }
   }
 
+  const IMAGE_EXT = ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'];
+  const SUPPORTED = ['pdf', 'docx', 'pptx', 'xlsx', 'xls', 'ods', 'txt', 'md', 'markdown', 'csv', 'html', 'htm', 'json', 'xml', 'log', ...IMAGE_EXT];
+
   async function convert(file, options) {
     const opts = Object.assign({}, DEFAULTS, options || {});
+    CUR = opts;
     const ext = extOf(file.name);
     const meta = { source: file.name, format: ext.toUpperCase() };
     let body = '', rawText = '';
@@ -689,6 +896,18 @@
     } else if (ext === 'docx') {
       body = await docxToMd(file.data, opts, meta);
       rawText = body.replace(/[#*|`>-]/g, '');
+    } else if (ext === 'pptx') {
+      body = await pptxToMd(file.data, opts, meta);
+      rawText = body;
+    } else if (ext === 'xlsx' || ext === 'xls' || ext === 'ods') {
+      body = sheetToMd(file.data, opts, meta);
+      rawText = body;
+    } else if (IMAGE_EXT.includes(ext)) {
+      if (!opts.ocr || !LIB.ocr) throw new Error('قراءة الصور تحتاج OCR — فعّله من الإعدادات (متوفر في التطبيق والمتصفح)');
+      if (LIB.progress) LIB.progress('OCR: ' + file.name);
+      const t = await LIB.ocr(file.data, file.name);
+      meta.ocrPages = [1];
+      body = blocksToMd(txtToBlocks(t || '', opts, true)); rawText = t || '';
     } else if (ext === 'html' || ext === 'htm') {
       const t = decodeText(file.data); rawText = t;
       body = htmlToMd(t, opts);
@@ -696,40 +915,51 @@
       const t = decodeText(file.data); rawText = t; body = csvToMd(t);
     } else if (ext === 'md' || ext === 'markdown') {
       body = decodeText(file.data); rawText = body;
-    } else if (ext === 'doc') {
-      throw new Error('صيغة .doc القديمة غير مدعومة — احفظ الملف من Word بصيغة .docx ثم أعد المحاولة');
+    } else if (ext === 'json' || ext === 'xml') {
+      const t = decodeText(file.data); rawText = t;
+      let pretty = t;
+      if (ext === 'json') { try { pretty = JSON.stringify(JSON.parse(t)); } catch (e) { /* keep */ } }
+      body = '```' + ext + '\n' + pretty.trim() + '\n```';
+    } else if (ext === 'doc' || ext === 'ppt') {
+      throw new Error(`صيغة .${ext} القديمة غير مدعومة — احفظ الملف بصيغة .${ext}x ثم أعد المحاولة`);
     } else {
       const t = decodeText(file.data); rawText = t;
       body = blocksToMd(txtToBlocks(t, opts));
     }
 
-    body = finalize(body, opts);
-    if (meta.scanned) {
-      body = '> ⚠️ هذا الـPDF يبدو ممسوحاً ضوئياً (صور بدون نص) — لم يُستخرج نص كافٍ.\n\n' + body;
+    body = compress(finalize(body, opts), opts).trim() + '\n';
+    const quality = qualityReport(body, meta, opts);
+    if (meta.scanned && !(meta.ocrPages && meta.ocrPages.length)) {
+      body = '> ⚠️ This PDF looks scanned (images only) — little text could be extracted.\n\n' + body;
     }
     const lang = detectLang(body);
 
-    // title
     let title = meta.title || '';
     const firstH = body.match(/^#\s+(.+)$/m);
     if (!title && firstH) title = firstH[1].trim();
+    if (!title) title = file.name.replace(/\.[^.]+$/, '');
 
     const parts = [];
     if (opts.frontMatter) {
-      const fm = ['---', `source: ${file.name}`, `format: ${meta.format}`];
-      if (meta.pages) fm.push(`pages: ${meta.pages}`);
-      if (title) fm.push(`title: ${title.replace(/\n/g, ' ')}`);
-      fm.push(`language: ${lang}`, '---');
-      parts.push(fm.join('\n'));
+      if (opts.level === 'strong') {
+        parts.push(`> Source: ${file.name}${meta.pages ? ` (${meta.pages} ${ext === 'pptx' ? 'slides' : 'pages'})` : ''}`);
+      } else {
+        const fm = ['---', `source: ${file.name}`, `format: ${meta.format}`];
+        if (meta.pages) fm.push(`${ext === 'pptx' ? 'slides' : 'pages'}: ${meta.pages}`);
+        if (meta.sheets) fm.push(`sheets: ${meta.sheets}`);
+        fm.push(`title: ${title.replace(/\n/g, ' ')}`);
+        fm.push(`language: ${lang}`, '---');
+        parts.push(fm.join('\n'));
+      }
     }
     if (opts.claudeNote) {
       parts.push(opts.noteLang === 'en'
-        ? '> **For Claude:** This is the full content of the file above, converted to Markdown with its original structure (headings, lists, tables). Read it completely and follow every instruction and requirement it contains.'
-        : '> **إلى Claude:** هذا هو المحتوى الكامل للملف المذكور أعلاه بعد تحويله إلى Markdown مع الحفاظ على بنيته (العناوين، القوائم، الجداول). اقرأه كاملاً والتزم بكل التعليمات والمتطلبات الواردة فيه.');
+        ? '> **For Claude:** Full content of this file, converted to Markdown with its original structure. Read it completely and follow every instruction and requirement it contains.'
+        : '> **إلى Claude:** هذا المحتوى الكامل للملف بعد تحويله إلى Markdown مع الحفاظ على بنيته. اقرأه كاملاً والتزم بكل التعليمات والمتطلبات الواردة فيه.');
     }
     if (opts.extractInstructions && estTokens(body) >= 600) {
       const ins = extractInstructions(body, 40);
-      if (ins.length) {
+      if (ins.length >= 2) {
         const head = opts.noteLang === 'en' ? '## Key instructions (extracted from the document)' : '## أهم التعليمات والمتطلبات (مستخرجة من المستند)';
         parts.push(head + '\n' + ins.map(s => '- ' + s).join('\n'));
       }
@@ -747,32 +977,238 @@
       name: file.name,
       mdName: file.name.replace(/\.[^.]+$/, '') + '.md',
       markdown: md,
+      body,
+      quality,
       meta: Object.assign(meta, { language: lang, title }),
       stats: {
         rawTokens,
         mdTokens: estTokens(md),
         chars: md.length,
         // Claude reads each PDF page as text + an image, roughly ≥1,500 extra tokens per page
-        pdfDirectTokens: meta.pages ? rawTokens + meta.pages * 1500 : null,
+        pdfDirectTokens: ext === 'pdf' && meta.pages ? rawTokens + meta.pages * 1500 : null,
       },
     };
   }
 
-  // Combine several converted files into one Markdown
+  // ---------- multi-file helpers ----------
+  // Remove paragraphs (>= 60 chars) that already appeared in an earlier document
+  function dedupeAcross(bodies) {
+    const seen = new Set();
+    let removed = 0;
+    const out = bodies.map(b => {
+      const mine = new Set();
+      let inCode = false;
+      const keep = [];
+      for (const para of b.split(/\n{2,}/)) {
+        const fences = (para.match(/^```/gm) || []).length;
+        const key = para.trim().toLowerCase().replace(/\s+/g, ' ');
+        if (!inCode && key.length >= 60 && !/^#{1,6}\s/.test(key) && !/^\|/.test(key)) {
+          if (seen.has(key)) { removed++; if (fences % 2) inCode = !inCode; continue; }
+          mine.add(key);
+        }
+        if (fences % 2) inCode = !inCode;
+        keep.push(para);
+      }
+      mine.forEach(k => seen.add(k));
+      return keep.join('\n\n');
+    });
+    return { bodies: out, removed };
+  }
+
   function combine(results, opts) {
     opts = Object.assign({}, DEFAULTS, opts || {});
     const intro = opts.noteLang === 'en'
       ? `> **For Claude:** This file bundles ${results.length} documents converted to Markdown. Read all of them and follow every instruction they contain.`
       : `> **إلى Claude:** هذا الملف يجمع ${results.length} مستندات محوّلة إلى Markdown. اقرأها جميعاً والتزم بكل التعليمات الواردة فيها.`;
+    const { bodies, removed } = opts.dedupe ? dedupeAcross(results.map(r => r.body)) : { bodies: results.map(r => r.body), removed: 0 };
     const body = results.map((r, i) => {
-      const md = r.markdown.replace(/^---[\s\S]*?\n---\n+/, '').replace(/^> \*\*(إلى Claude|For Claude):\*\*.*\n+/m, '');
-      const demoted = md.replace(/^(#{1,5})\s/gm, '#$1 ');
+      const demoted = bodies[i].replace(/^(#{1,5})\s/gm, '#$1 ');
       return `# ${i + 1}. ${r.name}\n\n${demoted.trim()}`;
     }).join('\n\n---\n\n');
-    return (opts.claudeNote ? intro + '\n\n' : '') + body + '\n';
+    const note = removed ? `\n> (${removed} duplicated paragraph(s) across files were removed)` : '';
+    return { markdown: (opts.claudeNote ? intro + note + '\n\n' : '') + body + '\n', removed };
   }
 
-  const api = { init, convert, combine, estTokens, DEFAULTS, _internal: { txtToBlocks, blocksToMd, finalize, extractInstructions, listInfo } };
+  // ---------- Claude Code package: docs/ + INDEX.md + CLAUDE.md ----------
+  function slug(t) {
+    return (t || '').toLowerCase().replace(/^[\d.\s]+/, '').replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/, '') || 'part';
+  }
+  function headingsOf(text) {
+    const lines = text.split('\n');
+    const heads = [];
+    let inCode = false;
+    lines.forEach((l, i) => {
+      if (/^```/.test(l)) { inCode = !inCode; return; }
+      if (inCode) return;
+      const m = l.match(/^(#{1,6})\s+(.*)$/);
+      if (m) heads.push({ i, lvl: m[1].length, text: m[2].trim() });
+    });
+    return { lines, heads };
+  }
+  function sectionize(text, depth) {
+    const { lines, heads } = headingsOf(text);
+    let L = null;
+    for (let lv = 1; lv <= 4; lv++) if (heads.filter(h => h.lvl === lv).length >= 2) { L = lv; break; }
+    if (!L) return [{ title: (heads[0] && heads[0].text) || '', text: text.trim() }];
+    const cuts = heads.filter(h => h.lvl <= L);
+    const secs = [];
+    if (cuts[0].i > 0) {
+      const pre = lines.slice(0, cuts[0].i).join('\n').trim();
+      const h = heads.find(x => x.i < cuts[0].i);
+      if (pre) secs.push({ title: h ? h.text : 'Overview', text: pre });
+    }
+    cuts.forEach((h, k) => {
+      const end = k + 1 < cuts.length ? cuts[k + 1].i : lines.length;
+      secs.push({ title: h.text, text: lines.slice(h.i, end).join('\n').trim() });
+    });
+    const merged = [];
+    for (const s of secs) {
+      const last = merged[merged.length - 1];
+      if (last && estTokens(last.text) < 250) { last.text += '\n\n' + s.text; last.titles.push(s.title); continue; }
+      merged.push(Object.assign(s, { titles: [s.title] }));
+    }
+    if (merged.length > 1 && estTokens(merged[merged.length - 1].text) < 150) {
+      const t = merged.pop(); merged[merged.length - 1].text += '\n\n' + t.text; merged[merged.length - 1].titles.push(t.title);
+    }
+    merged.forEach(m => {
+      if (m.titles.length > 1) { m.slugFrom = m.titles[1]; m.title = m.titles.slice(0, 3).join(' · '); }
+    });
+    if (depth >= 1) return merged;
+    const out = [];
+    for (const s of merged) {
+      if (estTokens(s.text) > 8000) {
+        const sub = sectionize(s.text, depth + 1);
+        if (sub.length > 1) { sub.forEach((x, k) => out.push({ title: k === 0 ? s.title : `${s.title} — ${x.title}`, slugFrom: k === 0 ? s.slugFrom : x.title, text: x.text })); continue; }
+      }
+      out.push(s);
+    }
+    return out;
+  }
+  function summaryOf(text) {
+    let inCode = false;
+    for (const raw of text.split('\n')) {
+      const l = raw.trim();
+      if (/^```/.test(l)) { inCode = !inCode; continue; }
+      if (inCode || !l || /^(#|\||>|---)/.test(l)) continue;
+      let s = l.replace(/^(-|\d+\.)\s+/, '').replace(/\*\*/g, '');
+      const cut = s.search(/[.!؟?](\s|$)/);
+      if (cut > 20) s = s.slice(0, cut + 1);
+      return s.length > 110 ? s.slice(0, 107).trim() + '…' : s;
+    }
+    return '';
+  }
+
+  const TECH = ['JavaScript', 'TypeScript', 'Node.js', 'NodeJS', 'React Native', 'React', 'Next.js', 'Vue', 'Nuxt', 'Angular', 'Svelte',
+    'Flutter', 'Dart', 'Kotlin', 'Java', 'SwiftUI', 'Swift', 'Python', 'Django', 'Flask', 'FastAPI', 'PHP', 'Laravel', 'Ruby on Rails', 'Golang',
+    'Rust', 'C#', '.NET', 'ASP.NET', 'Express', 'NestJS', 'Spring Boot', 'PostgreSQL', 'Postgres', 'MySQL', 'MariaDB', 'SQLite', 'MongoDB',
+    'Redis', 'Firebase', 'Firestore', 'Supabase', 'Prisma', 'Sequelize', 'TypeORM', 'GraphQL', 'REST API', 'gRPC', 'WebSocket', 'Socket.IO',
+    'Docker', 'Kubernetes', 'AWS', 'Azure', 'Google Cloud', 'GCP', 'Vercel', 'Netlify', 'Heroku', 'Cloudflare', 'Nginx', 'Tailwind', 'Bootstrap',
+    'Electron', 'Capacitor', 'Expo', 'Android', 'iOS', 'WhatsApp', 'Twilio', 'Stripe', 'PayPal', 'Google Maps', 'Mapbox', 'OpenAI', 'Claude',
+    'Gemini', 'Apps Script', 'Google Sheets', 'GitHub Actions', 'GitHub', 'Jest', 'Playwright', 'Cypress', 'Vite', 'Webpack', 'JWT', 'OAuth',
+    'Linux', 'Ubuntu', 'MetaTrader', 'MQL5', 'Telegram', 'Puppeteer', 'Selenium', 'Kafka', 'RabbitMQ', 'Elasticsearch', 'HTML', 'CSS', 'Sass', 'SQL'];
+  const TECH_ALIAS = { Postgres: 'PostgreSQL', NodeJS: 'Node.js', GCP: 'Google Cloud' };
+  function detectTech(text) {
+    const found = [];
+    for (const t of TECH) {
+      const esc = t.replace(/[.*+?^${}()|[\]\\#]/g, '\\$&');
+      const re = new RegExp('(?<![\\w.])' + esc + '(?![\\w])', t.length < 5 ? '' : 'i');
+      if (re.test(text)) {
+        const name = TECH_ALIAS[t] || t;
+        if (!found.includes(name) && !found.some(f => f !== name && f.includes(name) && name.length > 3)) found.push(name);
+      }
+    }
+    return found;
+  }
+  const NEG_RE = /\b(never|must not|mustn't|do not|don't|should not|shouldn't|cannot|can't|avoid|forbidden|prohibited|not allowed|no longer)\b|(^|\s)(لا ت|لا ي|ممنوع|يمنع|يُمنع|عدم|تجنب|تجنّب|يحظر|يُحظر|غير مسموح|إياك)/i;
+
+  function buildClaudeMd(results, fileMap, opts) {
+    const en = opts.noteLang !== 'ar';
+    const T = (a, b) => en ? a : b;
+    const bodies = results.map(r => r.body).join('\n\n');
+    const title = results.length === 1 ? results[0].meta.title : (results[0].meta.title || 'Project');
+    // overview: first real paragraph(s)
+    let overview = '';
+    let seenHead = 0;
+    for (const p of results[0].body.split(/\n{2,}/)) {
+      const t = p.trim();
+      if (/^#/.test(t)) { seenHead++; if (overview || seenHead > 2) break; continue; }
+      if (!t || /^(\||>|```|-|\d+\.)/.test(t)) continue;
+      overview += (overview ? ' ' : '') + t.replace(/\n/g, ' ').replace(/\*\*/g, '');
+      if (overview.length > 300) break;
+    }
+    if (overview.length > 480) overview = overview.slice(0, 477).replace(/\s\S*$/, '') + '…';
+    const tech = detectTech(bodies);
+    const rules = extractInstructions(bodies, 70);
+    const mustNot = rules.filter(r => NEG_RE.test(r));
+    const must = rules.filter(r => !NEG_RE.test(r));
+    const PHASE_RE = /\b(phase|stage|milestone|sprint|roadmap|step \d)|مرحلة|المرحلة|مراحل|خطة العمل|الخطوة/i;
+    const KEY_RE = /\b(requirement|feature|scope|api|endpoint|database|schema|data model|architecture|design|ui|ux|screen|security|auth|deploy|testing|acceptance)|متطلب|ميز|خصائص|قاعدة البيانات|الجداول|بنية|معمارية|تصميم|واجهة|شاشة|الأمان|الصلاحيات|النشر|اختبار|قبول/i;
+    const phases = fileMap.filter(f => PHASE_RE.test(f.title));
+    const keys = fileMap.filter(f => KEY_RE.test(f.title) && !PHASE_RE.test(f.title)).slice(0, 14);
+    const link = f => `- [${f.title}](${f.path})`;
+    const out = [];
+    out.push(`# CLAUDE.md — ${title}`);
+    out.push(T(`> Generated by MHM MD from: ${results.map(r => r.name).join(', ')}. The full spec is split under \`docs/\` — start with \`docs/INDEX.md\` and open only the files a task needs.`,
+      `> أُنشئ بواسطة MHM MD من: ${results.map(r => r.name).join('، ')}. المواصفات الكاملة مقسّمة داخل \`docs/\` — ابدأ بـ \`docs/INDEX.md\` وافتح فقط الملفات التي تحتاجها المهمة.`));
+    if (overview) out.push(T('## Project overview', '## نظرة عامة على المشروع') + '\n' + overview);
+    if (tech.length) out.push(T('## Tech mentioned in the spec', '## التقنيات المذكورة في المواصفات') + '\n' + tech.join(', '));
+    if (must.length) out.push(T('## Rules — must', '## قواعد يجب الالتزام بها') + '\n' + must.slice(0, 40).map(s => '- ' + s).join('\n'));
+    if (mustNot.length) out.push(T('## Rules — must not', '## ممنوعات') + '\n' + mustNot.slice(0, 30).map(s => '- ' + s).join('\n'));
+    if (phases.length) out.push(T('## Phases / milestones', '## المراحل') + '\n' + phases.map(link).join('\n'));
+    if (keys.length) out.push(T('## Key spec sections', '## أهم أقسام المواصفات') + '\n' + keys.map(link).join('\n'));
+    out.push(T('## How to work on this project', '## طريقة العمل على المشروع') + '\n' + (en
+      ? '- Before implementing something, read the matching file under `docs/` (see `docs/INDEX.md`).\n- Follow the rules above; they come straight from the spec.\n- If the spec is unclear or contradicts itself, ask before guessing.'
+      : '- قبل تنفيذ أي جزء، اقرأ الملف المناسب داخل `docs/` (راجع `docs/INDEX.md`).\n- التزم بالقواعد أعلاه فهي مأخوذة من المواصفات مباشرة.\n- إذا كانت المواصفات غير واضحة أو متناقضة، اسأل قبل أن تخمّن.'));
+    return out.join('\n\n') + '\n';
+  }
+
+  function buildProject(results, options) {
+    const opts = Object.assign({}, DEFAULTS, options || {});
+    const en = opts.noteLang !== 'ar';
+    const { bodies, removed } = opts.dedupe ? dedupeAcross(results.map(r => r.body)) : { bodies: results.map(r => r.body), removed: 0 };
+    const files = [];
+    const fileMap = [];
+    const indexParts = [];
+    let total = 0;
+    results.forEach((r, di) => {
+      const multi = results.length > 1;
+      const dir = multi ? `docs/${String(di + 1).padStart(2, '0')}-${slug(r.name.replace(/\.[^.]+$/, ''))}/` : 'docs/';
+      const relIndex = multi ? '../INDEX.md' : 'INDEX.md';
+      const body = bodies[di].trim();
+      const tok = estTokens(body);
+      let secs = tok < 1500 ? [{ title: r.meta.title, text: body }] : sectionize(body, 0);
+      if (secs.length === 1) secs[0].title = secs[0].title || r.meta.title;
+      const rows = [];
+      secs.forEach((s, k) => {
+        const name = secs.length === 1 ? `${slug(r.name.replace(/\.[^.]+$/, ''))}.md` : `${String(k + 1).padStart(2, '0')}-${slug(s.slugFrom || s.title)}.md`;
+        const path = dir + name;
+        const head = secs.length > 1 ? `> ${en ? 'Part' : 'الجزء'} ${k + 1}/${secs.length} · ${r.name} · ${en ? 'index' : 'الفهرس'}: ${relIndex}\n\n` : `> ${r.name} · ${en ? 'index' : 'الفهرس'}: ${relIndex}\n\n`;
+        const content = head + s.text.trim() + '\n';
+        const t = estTokens(content);
+        total += t;
+        files.push({ path, content });
+        fileMap.push({ path, title: s.title || r.meta.title, tokens: t });
+        rows.push(`| ${path.replace(/^docs\//, '')} | ${(s.title || r.meta.title).replace(/\|/g, '/')} | ${t.toLocaleString('en-US')} | ${summaryOf(s.text).replace(/\|/g, '/')} |`);
+      });
+      indexParts.push((multi ? `## ${di + 1}. ${r.name}\n\n` : '') +
+        `| ${en ? 'File' : 'الملف'} | ${en ? 'Section' : 'القسم'} | ~${en ? 'Tokens' : 'توكنز'} | ${en ? 'Summary' : 'ملخص'} |\n| --- | --- | --- | --- |\n` + rows.join('\n'));
+    });
+    const title = results.length === 1 ? results[0].meta.title : `${results.length} documents`;
+    const index = `# ${en ? 'Docs index' : 'فهرس المستندات'} — ${title}\n\n` +
+      (en ? `> ${files.length} file(s), ~${total.toLocaleString('en-US')} tokens in total. Open only the files a task needs.`
+        : `> ${files.length} ملف، حوالي ${total.toLocaleString('en-US')} توكن إجمالاً. افتح فقط الملفات التي تحتاجها المهمة.`) +
+      (removed ? (en ? ` ${removed} duplicated paragraph(s) across documents were removed.` : ` حُذفت ${removed} فقرة مكررة بين المستندات.`) : '') +
+      '\n\n' + indexParts.join('\n\n') + '\n';
+    files.unshift({ path: 'docs/INDEX.md', content: index });
+    const claudeMd = buildClaudeMd(results.map((r, i) => Object.assign({}, r, { body: bodies[i] })), fileMap, opts);
+    files.unshift({ path: 'CLAUDE.md', content: claudeMd });
+    return { files, claudeMd, index, totalTokens: total, removed };
+  }
+
+  const api = {
+    init, convert, combine, buildProject, estTokens, DEFAULTS, SUPPORTED, extOf,
+    _internal: { txtToBlocks, blocksToMd, finalize, extractInstructions, listInfo, compress, sectionize, detectTech, dedupeAcross, qualityReport },
+  };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.MHMConverter = api;
 })(typeof window !== 'undefined' ? window : globalThis);
